@@ -16,6 +16,7 @@
 #include <linux/ctype.h>
 #include <errno.h>
 #include <linux/list.h>
+#include <uboot_aes.h>
 
 #include <splash.h>
 #include <asm/io.h>
@@ -229,6 +230,76 @@ static int get_relfile_envaddr(cmd_tbl_t *cmdtp, const char *file_path,
 		return -EINVAL;
 
 	return get_relfile(cmdtp, file_path, file_addr);
+}
+
+static int get_encrypted_relfile_envaddr(cmd_tbl_t *cmdtp,
+										const char *file_path,
+			       						const char *envaddr_name,
+										unsigned long enc_offset)
+{
+	unsigned long file_addr = 0;
+	char *envaddr = NULL;
+	unsigned long file_size = 0;
+	char *image_filesize = NULL;
+	int err = 0;
+	u32 aes_blocks = 0;
+	unsigned long e_addr = 0;
+
+	u8 k_ptr[k_PTR_MAX_LENGTH] = K_INITIALIZER;
+	u8 iv_ptr[IV_PTR_MAX_LENGTH] = IV_INITIALIZER;
+	u8 *src_ptr = NULL;
+	u8 *dst_ptr = NULL;
+	u8 k_exp[AES256_EXPAND_KEY_LENGTH];
+	u32 k_len = AES128_KEY_LENGTH;
+
+	envaddr = from_env(envaddr_name);
+
+	if (!envaddr) {
+		err = -ENOENT;
+		goto exit;
+	}
+
+	if (strict_strtoul(envaddr, 16, &file_addr) < 0) {
+		err = -EINVAL;
+		goto exit;
+	}
+
+	/* 1. Load encrypted image. */
+	e_addr = file_addr + enc_offset;
+	err = get_relfile(cmdtp, file_path, e_addr);
+	if (err < 0) {
+		goto exit;
+	}
+
+	/* 2. Decrypt and load image to address. */
+	image_filesize = from_env("filesize");
+	if (!image_filesize) {
+		err = -ENOENT;
+		goto exit;
+	}
+
+	if (strict_strtoul(image_filesize, 16, &file_size) < 0) {
+		err = -EINVAL;
+		goto exit;
+	}
+
+	src_ptr = (uint8_t *)map_sysmem(e_addr, file_size);
+	dst_ptr = (uint8_t *)map_sysmem(file_addr, file_size);
+
+	/* 3. we expand the AES key. */
+	aes_expand_key(k_ptr, k_len, k_exp);
+
+	/* 4. Calculate the number of AES blocks to encrypt. */
+	aes_blocks = DIV_ROUND_UP(file_size, AES_BLOCK_LENGTH);
+
+	aes_cbc_decrypt_blocks(k_len, k_exp, iv_ptr, src_ptr,
+				       	   dst_ptr, aes_blocks);
+
+	unmap_sysmem(src_ptr);
+	unmap_sysmem(dst_ptr);
+
+exit:
+	return err;
 }
 
 /*
@@ -463,7 +534,9 @@ static int label_boot(cmd_tbl_t *cmdtp, struct pxe_label *label)
 	}
 
 	if (label->initrd) {
-		if (get_relfile_envaddr(cmdtp, label->initrd, "ramdisk_addr_r") < 0) {
+		/* Loading decrypted initrd to memory.  */
+		if (get_encrypted_relfile_envaddr(cmdtp,
+			label->initrd, "ramdisk_addr_r", INITRD_BASE_ADDR) < 0) {
 			/* A 0-byte initrd is OK on L4T */
 			printf("initrd not found or zero, skipping ...\n");
 		}
@@ -475,7 +548,10 @@ static int label_boot(cmd_tbl_t *cmdtp, struct pxe_label *label)
 		bootm_argc = 3;
 	}
 
-	if (get_relfile_envaddr(cmdtp, label->kernel, "kernel_addr_r") < 0) {
+	/* Loading decrypted kernel to memory.  */
+	if (get_encrypted_relfile_envaddr(cmdtp, 
+			label->kernel, "kernel_addr_r",
+			KERNEL_BASE_ADDRESS) < 0) {
 		printf("Skipping %s for failure retrieving kernel\n",
 		       label->name);
 		return 1;
@@ -502,11 +578,15 @@ static int label_boot(cmd_tbl_t *cmdtp, struct pxe_label *label)
 		char bootargs[CONFIG_SYS_CBSIZE] = "";
 		char finalbootargs[CONFIG_SYS_CBSIZE];
 
+		/* Add hashing K to boot argument that will be passed to kernel. */
+		char _k[MAX_HASHING_K_LENGTH] = " lo="HASHING_K;
+
 		if (strlen(label->append ?: "") +
-		    strlen(ip_str) + strlen(mac_str) + 1 > sizeof(bootargs)) {
-			printf("bootarg overflow %zd+%zd+%zd+1 > %zd\n",
+		    strlen(ip_str) + strlen(mac_str) +
+			strlen(_k) + 1 > sizeof(bootargs)) {
+			printf("bootarg overflow %zd+%zd+%zd+%zd+1 > %zd\n",
 			       strlen(label->append ?: ""),
-			       strlen(ip_str), strlen(mac_str),
+			       strlen(ip_str), strlen(mac_str), strlen(_k),
 			       sizeof(bootargs));
 			return 1;
 		}
@@ -516,8 +596,10 @@ static int label_boot(cmd_tbl_t *cmdtp, struct pxe_label *label)
 
 		strcat(bootargs, ip_str);
 		strcat(bootargs, mac_str);
+		strcat(bootargs, _k);
 
 		cli_simple_process_macros(bootargs, finalbootargs);
+			
 		env_set("bootargs", finalbootargs);
 		printf("append: %s\n", finalbootargs);
 	}
